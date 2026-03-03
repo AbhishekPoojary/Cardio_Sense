@@ -299,7 +299,7 @@
 
             // wire chat button on this card
             const chatBtn = resultEl.querySelector(".chat-with-ai");
-            if (chatBtn && window.openChatWithAI) {
+            if (chatBtn) {
               chatBtn.addEventListener("click", (e) => {
                 try {
                   const summary = JSON.parse(
@@ -313,10 +313,11 @@
                   }%\nClass probabilities:\n${Object.entries(probs)
                     .map(([k, v]) => `${k}: ${(v * 100).toFixed(1)}%`)
                     .join("\n")}`;
-                  window.openChatWithAI(analysisText);
+                  sessionStorage.setItem("chatContext", analysisText);
+                  window.location.href = "/chatbot";
                 } catch (err) {
                   console.error(err);
-                  window.openChatWithAI("");
+                  window.location.href = "/chatbot";
                 }
               });
             }
