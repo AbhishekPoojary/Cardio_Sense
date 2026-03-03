@@ -275,7 +275,7 @@
     <div
       class="max-w-6xl mx-auto px-4 py-4 flex flex-col sm:flex-row items-center justify-between text-sm text-slate-400"
     >
-      <div>© {{ 2025 }} AirPulse Lite — Prototype. All rights reserved.</div>
+      <div>© {{ current_year }} AirPulse Lite — Prototype. All rights reserved.</div>
       <div class="mt-2 sm:mt-0">
         Built with ❤️ • <a class="hover:text-white" href="#">Privacy</a> •
         <a class="hover:text-white" href="#">Terms</a>
@@ -334,11 +334,21 @@
         }
         const m = j.model;
         const exists = m.model_exists ? "Yes" : "No";
-        el.innerHTML = `Path: <code>${
-          m.model_path || "—"
-        }</code><br>Exists: <strong>${exists}</strong><br>Device: <code>${
-          m.device
-        }</code>`;
+        const modelPath = String(m.model_path || "—");
+
+        const esc = (s) =>
+          String(s)
+            .replace(/&/g, "&amp;")
+            .replace(/</g, "&lt;")
+            .replace(/>/g, "&gt;");
+
+        el.innerHTML = `
+          <div><span class="font-semibold">Path:</span></div>
+          <div class="font-mono text-slate-800 break-all">${esc(modelPath)}</div>
+          <div><span class="font-semibold">Exists:</span> <strong>${exists}</strong></div>
+          <div><span class="font-semibold">Device:</span> <code>${esc(m.device || "—")}</code></div>
+        `;
+
         if (quick) quick.classList.remove("hidden");
         if (quick)
           quick.addEventListener("click", (e) => {
