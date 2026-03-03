@@ -18,11 +18,12 @@ let visualGain = 1.0;
 const $ = (id) => document.getElementById(id);
 
 const scope = $("scope");
-const ctx = scope.getContext("2d");
+const ctx = scope ? scope.getContext("2d") : null;
 
 const deviceSelect = $("deviceSelect");
 const modeSelect = $("modeSelect");
 const modeBadge = $("modeBadge");
+const sourceSelect = $("sourceSelect");
 const btnStart = $("btnStart");
 const btnStop = $("btnStop");
 const btnRecord = $("btnRecord");
@@ -36,6 +37,9 @@ const downloadLink = $("downloadLink");
 const analyzeResult = $("analyzeResult");
 const statusEl = $("status");
 const durEl = $("dur");
+
+let sourceMode = "laptop";
+let ws = null;
 
 function setStatus(msg, type = "info") {
   statusEl.textContent = msg || "";
@@ -91,10 +95,21 @@ modeSelect?.addEventListener("change", () => {
   modeBadge.textContent = modeSelect.value;
 });
 
+sourceSelect?.addEventListener("change", () => {
+  sourceMode = sourceSelect.value;
+  if (sourceMode === "esp32") {
+    stopAudio();
+    startEsp32Stream();
+  } else {
+    stopEsp32Stream();
+    setStatus("Select a device and click Start.");
+  }
+});
+
 /* ---------- Canvas / ECG-style waveform with measurements ---------- */
 
 function resizeCanvas() {
-  if (!scope.parentElement) return;
+  if (!scope || !scope.parentElement || !ctx) return;
   scope.width = scope.parentElement.clientWidth;
   scope.height = scope.height || 260;
 }
@@ -104,9 +119,15 @@ resizeCanvas();
 let lastDrawTime = 0; // for FPS limiting
 
 function drawWave(ts = 0) {
-  if (!drawing || !analyser || !frameData || !displayBuffer) return;
+  if (!drawing || !frameData || !displayBuffer || !scope || !ctx) return;
+  
+  // In laptop mode, we need analyser
+  if (sourceMode === "laptop" && !analyser) {
+    requestAnimationFrame(drawWave);
+    return;
+  }
 
-  // ~30 FPS
+  // ~30 FPS throttle
   if (ts - lastDrawTime < 33) {
     requestAnimationFrame(drawWave);
     return;
@@ -209,33 +230,47 @@ function drawWave(ts = 0) {
   }
   ctx.restore();
 
-  // Get analyser data
-  analyser.getFloatTimeDomainData(frameData);
+  // Update data / gain depending on source
+  if (sourceMode === "laptop") {
+    // Get analyser data from laptop mic
+    analyser.getFloatTimeDomainData(frameData);
 
-  // --- Auto visual gain based on current frame amplitude ---
-  let peak = 0;
-  for (let i = 0; i < frameData.length; i++) {
-    const v = Math.abs(frameData[i]);
-    if (v > peak) peak = v;
-  }
+    // --- Auto visual gain based on current frame amplitude ---
+    let peak = 0;
+    for (let i = 0; i < frameData.length; i++) {
+      const v = Math.abs(frameData[i]);
+      if (v > peak) peak = v;
+    }
 
-  // if almost silence, keep gain=1
-  if (peak < 0.0005) {
-    // very quiet, don't explode gain
-    // slightly decay back toward 1
-    visualGain = 0.98 * visualGain + 0.02 * 1;
+    if (peak < 0.0005) {
+      visualGain = 0.98 * visualGain + 0.02 * 1;
+    } else {
+      const targetPeak = 0.7;
+      let desiredGain = targetPeak / peak;
+      desiredGain = Math.min(Math.max(desiredGain, 1), 10);
+      visualGain = 0.9 * visualGain + 0.1 * desiredGain;
+    }
+
+    // Push new frame into history buffer
+    displayBuffer.copyWithin(0, frameData.length);
+    displayBuffer.set(frameData, displayBuffer.length - frameData.length);
   } else {
-    const targetPeak = 0.7; // we want the peaks to use ~70% of vertical range
-    let desiredGain = targetPeak / peak;
-    // Limit how crazy we go
-    desiredGain = Math.min(Math.max(desiredGain, 1), 10); // 1x to 10x
-    // Smooth the gain to avoid jitter
-    visualGain = 0.9 * visualGain + 0.1 * desiredGain;
+    // ESP32 mode: frameData/displayBuffer updated in WebSocket handler.
+    // Derive gain from displayBuffer so we still autoscale.
+    let peak = 0;
+    for (let i = 0; i < displayBuffer.length; i++) {
+      const v = Math.abs(displayBuffer[i]);
+      if (v > peak) peak = v;
+    }
+    if (peak < 0.0005) {
+      visualGain = 0.98 * visualGain + 0.02 * 1;
+    } else {
+      const targetPeak = 0.7;
+      let desiredGain = targetPeak / peak;
+      desiredGain = Math.min(Math.max(desiredGain, 1), 10);
+      visualGain = 0.9 * visualGain + 0.1 * desiredGain;
+    }
   }
-
-  // Push new frame into history buffer
-  displayBuffer.copyWithin(0, frameData.length);
-  displayBuffer.set(frameData, displayBuffer.length - frameData.length);
 
   // Draw waveform (history)
   const len = displayBuffer.length;
@@ -297,6 +332,12 @@ async function startAudio() {
     mediaStream = await navigator.mediaDevices.getUserMedia(constraints);
 
     audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    
+    // Resume AudioContext (required for modern browsers)
+    if (audioCtx.state === 'suspended') {
+      await audioCtx.resume();
+    }
+    
     const src = audioCtx.createMediaStreamSource(mediaStream);
 
     analyser = audioCtx.createAnalyser();
@@ -315,7 +356,12 @@ async function startAudio() {
 
     displayBuffer = new Float32Array(historySamples);
 
+    // Connect audio graph: source -> analyser -> destination (muted)
+    const muteNode = audioCtx.createGain();
+    muteNode.gain.value = 0; // Mute to prevent feedback
     src.connect(analyser);
+    analyser.connect(muteNode);
+    muteNode.connect(audioCtx.destination);
 
     drawing = true;
     visualGain = 1.0; // reset visual gain on every start
@@ -328,12 +374,25 @@ async function startAudio() {
     setStatus("Live preview started.");
   } catch (e) {
     console.error(e);
-    setStatus("Mic error: " + e.message, "error");
+    if (e.name === 'NotAllowedError' || e.name === 'PermissionDeniedError') {
+      setStatus("⚠️ Microphone access denied. Please allow mic access in your browser, or switch to ESP32 mode.", "error");
+    } else if (e.name === 'NotFoundError') {
+      setStatus("⚠️ No microphone found. Please connect a mic or switch to ESP32 mode.", "error");
+    } else {
+      setStatus("Mic error: " + e.message, "error");
+    }
   }
 }
 
 function stopAudio() {
   drawing = false;
+
+  // Stop any active recording cleanly before killing the stream
+  if (mediaRecorder && mediaRecorder.state !== "inactive") {
+    try { mediaRecorder.stop(); } catch (e) { /* ignore */ }
+  }
+  mediaRecorder = null;
+  clearInterval(recTimer);
 
   if (mediaStream) {
     mediaStream.getTracks().forEach((t) => t.stop());
@@ -359,14 +418,196 @@ function stopAudio() {
   setStatus("Stopped.");
 }
 
-btnStart?.addEventListener("click", startAudio);
-btnStop?.addEventListener("click", stopAudio);
+function stopEsp32Stream() {
+  drawing = false;
+  if (ws) {
+    try {
+      ws.close();
+    } catch (e) { }
+    ws = null;
+  }
+
+  const w = scope.width;
+  const h = scope.height;
+  ctx.fillStyle = "#020617";
+  ctx.fillRect(0, 0, w, h);
+
+  btnStart.disabled = false;
+  btnStop.disabled = true;
+  btnRecord.disabled = true;
+  btnSave.disabled = true;
+  btnAnalyze.disabled = true;
+  btnRecord.textContent = "Record";
+
+  setStatus("Stopped ESP32 stream.");
+}
+
+function startEsp32Stream() {
+  stopEsp32Stream();
+
+  const bufferLen = 2048;
+  const sampleRate = 16000;
+  let historySamples = Math.floor(sampleRate * historySeconds);
+  frameData = new Float32Array(bufferLen);
+  displayBuffer = new Float32Array(historySamples);
+  drawing = true;
+  visualGain = 1.0;
+  requestAnimationFrame(drawWave);
+
+  const url = "ws://localhost:8765/";
+  ws = new WebSocket(url);
+  ws.binaryType = "arraybuffer";
+
+  ws.onopen = () => {
+    setStatus("Connected to ESP32 bridge.");
+    btnRecord.disabled = false;
+  };
+  ws.onerror = (e) => {
+    console.error("WebSocket Error:", e);
+    setStatus("ESP32 bridge error - could not connect to Python backend.", "error");
+    stopEsp32Stream();
+  };
+  ws.onclose = () => {
+    setStatus("ESP32 bridge disconnected.");
+    stopEsp32Stream();
+  };
+
+  ws.onmessage = (event) => {
+    if (!displayBuffer || !frameData) return;
+    const buf = event.data;
+    const int16 = new Int16Array(buf);
+    const N = Math.min(int16.length, frameData.length);
+    for (let i = 0; i < N; i++) {
+      frameData[i] = int16[i] / 32768.0;
+    }
+    displayBuffer.copyWithin(0, N);
+    displayBuffer.set(
+      frameData.subarray(0, N),
+      displayBuffer.length - N
+    );
+    if (espRecording) {
+      espRecordChunks.push(new Float32Array(frameData.subarray(0, N)));
+    }
+  };
+
+  btnStart.disabled = true;
+  btnStop.disabled = false;
+  btnRecord.disabled = true;
+  btnSave.disabled = true;
+  btnAnalyze.disabled = true;
+}
+
+btnStart?.addEventListener("click", () => {
+  if (sourceMode === "esp32") {
+    startEsp32Stream();
+  } else {
+    startAudio();
+  }
+});
+
+btnStop?.addEventListener("click", () => {
+  if (sourceMode === "esp32") {
+    stopEsp32Stream();
+  } else {
+    stopAudio();
+  }
+});
 
 /* ---------- Recording ---------- */
 
 let recTimer = null;
+let espRecording = false;
+let espRecordChunks = [];
+
+function floatToWav(buffers) {
+  let length = 0;
+  buffers.forEach(b => length += b.length);
+  const buffer = new ArrayBuffer(44 + length * 2);
+  const view = new DataView(buffer);
+
+  const writeString = (v, offset) => {
+    for (let i = 0; i < v.length; i++) view.setUint8(offset + i, v.charCodeAt(i));
+  };
+  writeString('RIFF', 0);
+  view.setUint32(4, 36 + length * 2, true);
+  writeString('WAVE', 8);
+  writeString('fmt ', 12);
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, 16000, true);
+  view.setUint32(28, 16000 * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  writeString('data', 36);
+  view.setUint32(40, length * 2, true);
+
+  let offset = 44;
+  for (let i = 0; i < buffers.length; i++) {
+    for (let j = 0; j < buffers[i].length; j++) {
+      let s = Math.max(-1, Math.min(1, buffers[i][j]));
+      view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+      offset += 2;
+    }
+  }
+  return new Blob([view], { type: 'audio/wav' });
+}
 
 btnRecord?.addEventListener("click", () => {
+  if (sourceMode === "esp32") {
+    if (!ws) {
+      setStatus("No ESP32 connection.", "error");
+      return;
+    }
+    if (espRecording) {
+      espRecording = false;
+      clearInterval(recTimer);
+      setStatus("Finalizing recording...");
+      btnRecord.disabled = true;
+
+      // Extract custom WAV
+      lastBlob = floatToWav(espRecordChunks);
+      btnSave.disabled = false;
+      btnAnalyze.disabled = false;
+
+      setStatus(
+        `Recorded ${durationSec.toFixed(1)}s. Click Save to upload or preview/download.`,
+        "success"
+      );
+
+      const url = URL.createObjectURL(lastBlob);
+      if (previewAudio) {
+        previewAudio.src = url;
+        previewWrap.classList.remove("hidden");
+        downloadLink.href = url;
+        downloadLink.classList.remove("hidden");
+      }
+
+      btnRecord.textContent = "Record";
+      btnRecord.disabled = false;
+      return;
+    }
+
+    // Start ESP recording
+    espRecordChunks = [];
+    durationSec = 0;
+    durEl.textContent = "0.0";
+    previewWrap.classList.add("hidden");
+    downloadLink.classList.add("hidden");
+    lastBlob = null;
+    espRecording = true;
+
+    recTimer = setInterval(() => {
+      durationSec += 0.25;
+      durEl.textContent = durationSec.toFixed(1);
+    }, 250);
+
+    setStatus("Recording...");
+    btnRecord.textContent = "Stop";
+    return;
+  }
+
+  // Standard Laptop Microphone (MediaRecorder) handling
   if (!mediaStream) {
     setStatus("No audio stream. Please start preview first.", "error");
     return;
@@ -387,15 +628,17 @@ btnRecord?.addEventListener("click", () => {
   downloadLink.classList.add("hidden");
   lastBlob = null;
 
-  // Choose supported mimeType
+  // Choose supported mimeType (prefer webm for Chrome/Edge, ogg for Firefox)
   let mime = "";
   if (window.MediaRecorder && MediaRecorder.isTypeSupported) {
-    if (MediaRecorder.isTypeSupported("audio/wav;codecs=opus")) {
-      mime = "audio/wav;codecs=opus";
-    } else if (MediaRecorder.isTypeSupported("audio/wav")) {
-      mime = "audio/wav";
+    if (MediaRecorder.isTypeSupported("audio/webm;codecs=opus")) {
+      mime = "audio/webm;codecs=opus";
+    } else if (MediaRecorder.isTypeSupported("audio/webm")) {
+      mime = "audio/webm";
     } else if (MediaRecorder.isTypeSupported("audio/ogg;codecs=opus")) {
       mime = "audio/ogg;codecs=opus";
+    } else if (MediaRecorder.isTypeSupported("audio/ogg")) {
+      mime = "audio/ogg";
     }
   }
 
@@ -446,7 +689,7 @@ btnRecord?.addEventListener("click", () => {
       previewWrap.classList.remove("hidden");
       downloadLink.href = url;
       downloadLink.classList.remove("hidden");
-      // Try to generate a spectrogram preview on the server (Python)
+      // Generate Spectrogram UI if we want (kept code)
       (async () => {
         try {
           const file = new File([lastBlob], "preview.wav", {
@@ -458,11 +701,7 @@ btnRecord?.addEventListener("click", () => {
             method: "POST",
             body: fd,
           });
-          if (!resp.ok) {
-            // server didn't return an image; skip
-            console.warn("Spectrogram preview failed", resp.status);
-            return;
-          }
+          if (!resp.ok) return;
           const blob = await resp.blob();
           const imgUrl = URL.createObjectURL(blob);
           const specWrap = document.getElementById("previewSpecWrap");
@@ -472,7 +711,7 @@ btnRecord?.addEventListener("click", () => {
             if (specWrap) specWrap.classList.remove("hidden");
           }
         } catch (e) {
-          console.warn("Spectrogram preview error", e);
+          console.warn(e);
         }
       })();
     }
@@ -481,7 +720,13 @@ btnRecord?.addEventListener("click", () => {
     btnRecord.disabled = false;
   };
 
-  mediaRecorder.start(250);
+  try {
+    mediaRecorder.start(250);
+  } catch (e) {
+    setStatus("Failed to start recording: " + e.message, "error");
+    btnRecord.textContent = "Record";
+    return;
+  }
 
   recTimer = setInterval(() => {
     durationSec += 0.25;
@@ -596,7 +841,7 @@ btnSave?.addEventListener("click", async () => {
           showAnalysisError(json || { error: "analyze_failed", detail: text });
           setStatus(
             "Analysis failed: " +
-              ((json && (json.hint || json.error)) || "Unknown"),
+            ((json && (json.hint || json.error)) || "Unknown"),
             "error"
           );
         }
@@ -633,9 +878,8 @@ btnAnalyze?.addEventListener("click", async () => {
     // show a quick local analysis card with spectrogram while server runs
     // we call upload & analyze afterwards but keep the spectrogram visible
     // create a temporary placeholder analysis UI
-    analyzeResult.innerHTML = `<div class="card p-4"><h4 class="font-semibold">Analysis (running)</h4><div class="mt-3">Generating analysis — please wait…</div><div class="mt-4"><div class="text-sm text-slate-600 mb-2">Spectrogram (preview)</div><div class="w-full bg-slate-50 p-2 rounded"><img id="specImg" src="${
-      lastSpectrogramDataUrl || ""
-    }" alt="Spectrogram preview" class="w-full rounded" style="max-height:320px;object-fit:contain" /></div></div></div>`;
+    analyzeResult.innerHTML = `<div class="card p-4"><h4 class="font-semibold">Analysis (running)</h4><div class="mt-3">Generating analysis — please wait…</div><div class="mt-4"><div class="text-sm text-slate-600 mb-2">Spectrogram (preview)</div><div class="w-full bg-slate-50 p-2 rounded"><img id="specImg" src="${lastSpectrogramDataUrl || ""
+      }" alt="Spectrogram preview" class="w-full rounded" style="max-height:320px;object-fit:contain" /></div></div></div>`;
 
     const file = new File([lastBlob], "capture.wav", { type: lastBlob.type });
     const fd = new FormData();
@@ -680,7 +924,7 @@ btnAnalyze?.addEventListener("click", async () => {
       showAnalysisError(json || { error: "analyze_failed", detail: text });
       setStatus(
         "Analysis failed: " +
-          ((json && (json.hint || json.error)) || "Unknown"),
+        ((json && (json.hint || json.error)) || "Unknown"),
         "error"
       );
     }
@@ -693,7 +937,7 @@ btnAnalyze?.addEventListener("click", async () => {
 
 /* ---------- Show analysis ---------- */
 
-function showAnalysis(results, took_ms, rec_id) {
+function showAnalysis(results, took_ms, rec_id, spectrogramUrl) {
   if (!analyzeResult) return;
 
   const r = results || {};
@@ -734,9 +978,8 @@ function showAnalysis(results, took_ms, rec_id) {
           <div class="font-medium">${r.confidence_percent}%</div>
         </div>
         <div class="w-full bg-slate-100 rounded-full h-3">
-          <div style="width:${r.confidence_percent}%" class="h-3 rounded-full ${
-    r.confidence_percent >= 50 ? "bg-emerald-500" : "bg-rose-500"
-  }"></div>
+          <div style="width:${r.confidence_percent}%" class="h-3 rounded-full ${r.confidence_percent >= 50 ? "bg-emerald-500" : "bg-rose-500"
+    }"></div>
         </div>
       </div>
 
@@ -763,8 +1006,8 @@ function showAnalysis(results, took_ms, rec_id) {
   // load spectrogram image if we have a recording id OR a local preview
   const specImg = document.getElementById("specImg");
   if (specImg) {
-    if (window.__local_spec_dataurl) {
-      specImg.src = window.__local_spec_dataurl;
+    if (spectrogramUrl) {
+      specImg.src = spectrogramUrl;
     } else if (rec_id) {
       specImg.src = `/api/spectrogram/${rec_id}?chunk=0`;
     }
@@ -774,23 +1017,16 @@ function showAnalysis(results, took_ms, rec_id) {
     });
   }
 
-  // wire chat button if available
+  // wire chat button — store context in sessionStorage and navigate to chatbot page
   const chatBtn = document.getElementById("chatWithAiBtn");
-  if (chatBtn && window.openChatWithAI) {
-    const analysisText = `Decision: ${r.overall_decision}\nPredicted: ${
-      r.predicted_class
-    }\nConfidence: ${
-      r.confidence_percent
-    }%\nProcessed in ${took} ms\nClass probabilities:\n${Object.entries(probs)
-      .map(([k, v]) => `${k}: ${(v * 100).toFixed(1)}%`)
-      .join("\n")}`;
+  if (chatBtn) {
+    const analysisText = `Decision: ${r.overall_decision}\nPredicted: ${r.predicted_class}\nConfidence: ${r.confidence_percent}%\nProcessed in ${took} ms\nClass probabilities:\n${Object.entries(probs)
+        .map(([k, v]) => `${k}: ${(v * 100).toFixed(1)}%`)
+        .join("\n")}`;
     chatBtn.addEventListener("click", (e) => {
       e.preventDefault();
-      try {
-        window.openChatWithAI(analysisText);
-      } catch (err) {
-        console.error(err);
-      }
+      sessionStorage.setItem("chatContext", analysisText);
+      window.location.href = "/chatbot";
     });
   }
 }
@@ -853,14 +1089,12 @@ async function generateSpectrogramFromBlob(blob, opts = {}) {
   const maxHeight = opts.maxHeight || 256;
 
   const arrayBuffer = await blob.arrayBuffer();
-  const audioCtxLocal = new (window.OfflineAudioContext ||
-    window.webkitOfflineAudioContext)(1, 1, 44100);
-  // decodeAudioData works on AudioContext too
+  // decodeAudioData works on AudioContext
   const tmpCtx = new (window.AudioContext || window.webkitAudioContext)();
   const audioBuffer = await tmpCtx.decodeAudioData(arrayBuffer.slice(0));
   try {
     tmpCtx.close && tmpCtx.close();
-  } catch (e) {}
+  } catch (e) { }
 
   // mix to mono
   const ch =
@@ -963,10 +1197,7 @@ async function generateSpectrogramFromBlob(blob, opts = {}) {
   const dctx = displayCanvas.getContext("2d");
   dctx.drawImage(canvas, 0, 0, displayCanvas.width, displayCanvas.height);
 
-  const dataUrl = displayCanvas.toDataURL("image/png");
-  // store to window for showAnalysis to pick up if needed
-  window.__local_spec_dataurl = dataUrl;
-  return dataUrl;
+  return displayCanvas.toDataURL("image/png");
 }
 
 function showAnalysisError(json) {
@@ -986,11 +1217,12 @@ function showAnalysisError(json) {
 /* ---------- Init ---------- */
 
 (async function init() {
-  try {
-    await navigator.mediaDevices.getUserMedia({ audio: true });
-  } catch {
-    // user may allow later
-  }
+  // Only request mic permission if user is in Laptop mode
+  // (ESP32 mode doesn't need it)
   await listDevices();
-  setStatus("Select a device and click Start.");
+  if (sourceMode === "laptop") {
+    setStatus("Select a device and click Start.");
+  } else {
+    setStatus("ESP32 mode selected. Click START to receive WiFi audio.");
+  }
 })();
