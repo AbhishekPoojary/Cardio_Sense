@@ -158,4 +158,16 @@ document.addEventListener("DOMContentLoaded", function () {
   }
 
   loadRecordings();
+
+  // Auto-start chat if redirected from diagnose page with pre-loaded context
+  const preContext = sessionStorage.getItem("chatContext");
+  if (preContext) {
+    sessionStorage.removeItem("chatContext");
+    systemPrompt = preContext;
+    chatSection.classList.remove("hidden");
+    chatMessages.innerHTML = "";
+    chatHistory = [];
+    appendMessage("system", systemPrompt);
+    appendMessage("assistant", "I have your analysis results. What would you like to know about them?");
+  }
 });
