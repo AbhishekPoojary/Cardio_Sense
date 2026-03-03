@@ -1,3 +1,6 @@
+from dotenv import load_dotenv
+load_dotenv()
+
 from flask import (
     Flask,
     render_template,
@@ -30,6 +33,11 @@ app.config["MAX_CONTENT_LENGTH"] = 200 * 1024 * 1024
 # basic logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("airpulse")
+
+
+@app.context_processor
+def inject_globals():
+    return {"current_year": datetime.datetime.now().year}
 
 
 # -------------------------
@@ -476,28 +484,30 @@ def api_chat():
     if not messages or not isinstance(messages, list):
         return jsonify({"ok": False, "error": "No messages provided"}), 400
 
-    api_key = os.environ.get("OPENAI_API_KEY")
+    api_key = os.environ.get("OPENROUTER_API_KEY") or os.environ.get("OPENAI_API_KEY")
     if not api_key:
         return jsonify(
             {
                 "ok": False,
-                "error": "OpenAI API key not configured on server. Set OPENAI_API_KEY environment variable.",
+                "error": "OpenRouter API key not configured on server. Set OPENROUTER_API_KEY environment variable.",
             }
         ), 500
 
     body = {
-        "model": "gpt-3.5-turbo",
+        "model": "openai/gpt-3.5-turbo",
         "messages": messages,
         "max_tokens": 512,
         "temperature": 0.7,
     }
 
     req = urllib.request.Request(
-        "https://api.openai.com/v1/chat/completions",
+        "https://openrouter.ai/api/v1/chat/completions",
         data=json.dumps(body).encode("utf-8"),
         headers={
             "Content-Type": "application/json",
             "Authorization": f"Bearer {api_key}",
+            "HTTP-Referer": "http://127.0.0.1:5000",
+            "X-Title": "Cardio Sense App",
         },
     )
 
@@ -516,6 +526,31 @@ def api_chat():
         except Exception:
             detail = str(e)
         logger.exception("OpenAI HTTP error")
+        
+        # Handle rate limit specifically
+        if e.code == 429:
+            return (
+                jsonify({
+                    "ok": False, 
+                    "error": "Rate limit exceeded. Please wait a moment before trying again.",
+                    "error_type": "rate_limit",
+                    "detail": detail
+                }),
+                429,
+            )
+        
+        # Handle unauthorized specifically
+        if e.code == 401:
+            return (
+                jsonify({
+                    "ok": False, 
+                    "error": "Invalid OpenRouter API key. Please check your OPENROUTER_API_KEY environment variable.",
+                    "error_type": "invalid_api_key",
+                    "detail": detail
+                }),
+                401,
+            )
+        
         return (
             jsonify({"ok": False, "error": "OpenAI API error", "detail": detail}),
             500,
