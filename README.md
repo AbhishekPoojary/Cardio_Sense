@@ -42,8 +42,4 @@ python app.py
 - `ml_inference.py` provides `get_model_info()` used by `/model-info`.
 - Consider adding tests, pinning runtime dependencies, and moving configuration (model path, DB path, sample rate) into environment variables.
 
-If you want, I can:
 
-- Add environment-based configuration (`.env` + `python-dotenv`).
-- Pin and update `requirements.txt` with ML-friendly versions.
-- Add a small unit/integration test for the upload API.
