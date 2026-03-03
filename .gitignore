@@ -4,3 +4,6 @@ __pycache__/
 .venv/
 uploads/
 app.db
+*.pth
+*.wav
+final_model.pth/
